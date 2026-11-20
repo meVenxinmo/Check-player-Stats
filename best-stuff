@@ -1,0 +1,881 @@
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local RS = game:GetService("ReplicatedStorage")
+local LocalPlayer = Players.LocalPlayer
+local env = (getgenv and getgenv()) or _G
+
+if env.VD_Stop then
+	pcall(env.VD_Stop)
+end
+env.VD_Ingest = nil
+
+local TITLE = "Level Scout"
+local running = true
+local conns = {}
+local function track(c)
+	conns[#conns + 1] = c
+	return c
+end
+
+local KEYS = {"MaxSize", "EatSpeed", "Multiplier", "Speed"}
+local ROLEWORDS = {"admin", "mod", "owner", "dev", "staff", "founder", "manager", "creator", "helper", "head"}
+local ATTRWORDS = {"admin", "moderator", "ismod", "staff", "rank", "role", "vip"}
+
+local MECH = {
+	maxsize = {
+		value = function(lv)
+			return 50 * lv * (lv + 1)
+		end,
+		level = function(v)
+			return (-1 + math.sqrt(1 + 4 * v / 50)) / 2
+		end,
+	},
+	eatspeed = {
+		value = function(lv)
+			return 1 + 0.2 * (lv - 1)
+		end,
+		level = function(v)
+			return (v - 1) / 0.2 + 1
+		end,
+	},
+	multiplier = {
+		value = function(lv)
+			return lv
+		end,
+		level = function(v)
+			return v
+		end,
+	},
+	speed = {
+		value = function(lv)
+			return 12 + 2 * (lv - 1)
+		end,
+		level = function(v)
+			return (v - 12) / 2 + 1
+		end,
+	},
+}
+
+local function normStr(s)
+	return string.lower((tostring(s):gsub("[^%a]", "")))
+end
+
+local function hasWord(name, words)
+	local l = string.lower(tostring(name))
+	for _, w in ipairs(words) do
+		if l:find(w, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+local function toNum(v)
+	if type(v) == "number" then
+		return v
+	end
+	if type(v) == "string" then
+		return tonumber((v:gsub(",", "")))
+	end
+end
+
+local function fmt(v)
+	local r = math.floor(v * 10 + 0.5) / 10
+	local s = tostring(r)
+	local int, frac = s:match("^(-?%d+)(%.?%d*)$")
+	if not int then
+		return s
+	end
+	local sign = ""
+	if int:sub(1, 1) == "-" then
+		sign = "-"
+		int = int:sub(2)
+	end
+	int = int:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
+	return sign .. int .. frac
+end
+
+local byId, byName = {}, {}
+local function rebuildMaps()
+	byId, byName = {}, {}
+	for _, p in ipairs(Players:GetPlayers()) do
+		byId[p.UserId] = p
+		byName[p.Name] = p
+		byName[p.DisplayName] = p
+	end
+end
+rebuildMaps()
+track(Players.PlayerAdded:Connect(rebuildMaps))
+track(Players.PlayerRemoving:Connect(function()
+	task.defer(rebuildMaps)
+end))
+
+local KEYSET = {}
+for _, k in ipairs(KEYS) do
+	KEYSET[normStr(k)] = true
+end
+local SUFFIX = {value = true, amount = true, level = true, lv = true, lvl = true, levels = true, upgrade = true, upgrades = true}
+local LEAFV = {value = true, amount = true, current = true, level = true, lv = true, lvl = true, levels = true}
+local ATTRCLASS = {Player = true, Folder = true, Configuration = true, Humanoid = true, Model = true}
+
+local function isTarget(nk)
+	if KEYSET[nk] then
+		return true
+	end
+	for k in pairs(KEYSET) do
+		if nk:sub(1, #k) == k and SUFFIX[nk:sub(#k + 1)] then
+			return true
+		end
+		if nk == "level" .. k or nk == "lv" .. k or nk == "current" .. k then
+			return true
+		end
+	end
+	return false
+end
+
+local function nameHit(name, parentName)
+	local nk = normStr(name)
+	if isTarget(nk) then
+		return true
+	end
+	if parentName and LEAFV[nk] and KEYSET[normStr(parentName)] then
+		return true
+	end
+	return false
+end
+
+local MAXPER = 120
+local found = {}
+local lastScan = {}
+local seq = 0
+
+local function ownerOf(obj)
+	local path = {}
+	local p = obj
+	local guard = 0
+	while p and p ~= game and guard < 40 do
+		guard = guard + 1
+		local o
+		if p:IsA("Player") then
+			o = p
+		else
+			o = Players:GetPlayerFromCharacter(p) or byName[p.Name] or byId[tonumber(p.Name) or -1]
+		end
+		if o then
+			local rev = {}
+			for i = #path, 1, -1 do
+				rev[#rev + 1] = path[i]
+			end
+			return o, rev
+		end
+		path[#path + 1] = p.Name
+		p = p.Parent
+	end
+end
+
+local function addFound(player, obj, attr, base)
+	local f = found[player]
+	if not f then
+		f = {n = 0, list = {}}
+		found[player] = f
+	end
+	local id = attr and ("a:" .. attr) or "v"
+	local slot = f.list[obj]
+	if not slot then
+		if f.n >= MAXPER then
+			return
+		end
+		slot = {}
+		f.list[obj] = slot
+	end
+	if not slot[id] then
+		f.n = f.n + 1
+		seq = seq + 1
+		local segs = {}
+		for i, seg in ipairs(base) do
+			segs[i] = normStr(seg)
+		end
+		if attr then
+			segs[#segs + 1] = normStr(attr)
+		end
+		slot[id] = {s = segs, obj = obj, attr = attr, q = seq}
+	end
+end
+
+local function considerInstance(obj)
+	local isV = obj:IsA("ValueBase")
+	local parentName = obj.Parent and obj.Parent.Name or nil
+	local wantV = isV and nameHit(obj.Name, parentName)
+	local attrNames
+	if isV or ATTRCLASS[obj.ClassName] then
+		for name in pairs(obj:GetAttributes()) do
+			if nameHit(name, obj.Name) then
+				attrNames = attrNames or {}
+				attrNames[#attrNames + 1] = name
+			end
+		end
+	end
+	if not wantV and not attrNames then
+		return
+	end
+	if obj:FindFirstAncestorOfClass("PlayerGui") then
+		return
+	end
+	local owner, base = ownerOf(obj)
+	if not owner then
+		return
+	end
+	if wantV then
+		addFound(owner, obj, nil, base)
+	end
+	if attrNames then
+		for _, name in ipairs(attrNames) do
+			addFound(owner, obj, name, base)
+		end
+	end
+end
+
+local function scanTreeLight(root)
+	pcall(considerInstance, root)
+	local n = 0
+	for _, o in ipairs(root:GetDescendants()) do
+		pcall(considerInstance, o)
+		n = n + 1
+		if n % 1500 == 0 then
+			task.wait()
+			if not running then
+				return
+			end
+		end
+	end
+end
+
+local SKIP = {PlayerGui = true, Backpack = true, StarterGear = true, PlayerScripts = true}
+local function scanPlayer(plr)
+	pcall(considerInstance, plr)
+	for _, c in ipairs(plr:GetChildren()) do
+		if not SKIP[c.ClassName] then
+			scanTreeLight(c)
+		end
+	end
+	local ch = plr.Character
+	if ch then
+		pcall(considerInstance, ch)
+		for _, c in ipairs(ch:GetChildren()) do
+			if c:IsA("ValueBase") or c:IsA("Folder") or c:IsA("Configuration") or c:IsA("Humanoid") then
+				scanTreeLight(c)
+			end
+		end
+	end
+	lastScan[plr] = os.clock()
+end
+
+local function scanWorld()
+	scanTreeLight(RS)
+	for _, a in ipairs(workspace:GetChildren()) do
+		if byName[a.Name] or byId[tonumber(a.Name) or -1] then
+			scanTreeLight(a)
+		else
+			for _, b in ipairs(a:GetChildren()) do
+				if byName[b.Name] or byId[tonumber(b.Name) or -1] then
+					scanTreeLight(b)
+				end
+			end
+		end
+	end
+end
+
+local function readEntry(e)
+	local o = e.obj
+	if not o or (o.Parent == nil and not o:IsA("Player")) then
+		return nil
+	end
+	local ok, v
+	if e.attr then
+		ok, v = pcall(function()
+			return o:GetAttribute(e.attr)
+		end)
+	else
+		ok, v = pcall(function()
+			return o.Value
+		end)
+	end
+	if ok then
+		return toNum(v)
+	end
+end
+
+local function rawStat(player, key)
+	local f = found[player]
+	if not f then
+		return nil, nil
+	end
+	local k = normStr(key)
+	local plain, level, pq, lq
+	for _, slot in pairs(f.list) do
+		for _, e in pairs(slot) do
+			local sg = e.s
+			local leaf = sg[#sg]
+			local isVal, isLv = false, false
+			if leaf == k or leaf == k .. "value" or leaf == k .. "amount" or leaf == "current" .. k then
+				isVal = true
+				for i = 1, #sg - 1 do
+					if sg[i]:find("level", 1, true) or sg[i] == "lv" or sg[i] == "lvl" then
+						isVal, isLv = false, true
+					end
+				end
+			elseif leaf == k .. "level" or leaf == k .. "lv" or leaf == k .. "lvl" or leaf == "level" .. k or leaf == "lv" .. k or leaf == k .. "upgrade" or leaf == k .. "upgrades" then
+				isLv = true
+			else
+				for i = 1, #sg - 1 do
+					if sg[i] == k then
+						if leaf == "value" or leaf == "amount" or leaf == "current" then
+							isVal = true
+						elseif leaf == "level" or leaf == "lv" or leaf == "lvl" then
+							isLv = true
+						end
+					end
+				end
+			end
+			if isVal or isLv then
+				local n = readEntry(e)
+				if n then
+					if isVal and (not pq or e.q < pq) then
+						plain, pq = n, e.q
+					end
+					if isLv and (not lq or e.q < lq) then
+						level, lq = n, e.q
+					end
+				end
+			end
+		end
+	end
+	return plain, level
+end
+
+local function resolveStat(key, plain, level, mode)
+	local m = MECH[normStr(key)]
+	if level then
+		local value = plain
+		if not value and m then
+			value = m.value(level)
+		end
+		return value, level, true
+	end
+	if not plain then
+		return nil, nil, true
+	end
+	if mode == "value" and m then
+		local x = m.level(plain)
+		local r = math.floor(x + 0.5)
+		return plain, r, r >= 1 and math.abs(x - r) < 1e-6
+	end
+	if m then
+		return m.value(plain), plain, true
+	end
+	return nil, plain, true
+end
+
+local function playerMode(raws)
+	for _, r in pairs(raws) do
+		if r[1] and not r[2] and r[1] % 1 ~= 0 then
+			return "value"
+		end
+	end
+	return "level"
+end
+
+local roleCache = {}
+local function getRole(player)
+	local c = roleCache[player]
+	if c then
+		return c
+	end
+	roleCache[player] = {text = "Player", mod = false}
+	task.spawn(function()
+		local text, mod = "Player", false
+		if game.CreatorType == Enum.CreatorType.User and player.UserId == game.CreatorId then
+			text, mod = "Owner", true
+		elseif game.CreatorType == Enum.CreatorType.Group then
+			local ok1, rank = pcall(function()
+				return player:GetRankInGroup(game.CreatorId)
+			end)
+			local ok2, role = pcall(function()
+				return player:GetRoleInGroup(game.CreatorId)
+			end)
+			if ok1 and ok2 and rank > 0 then
+				text = role .. " (rank " .. rank .. ")"
+				if hasWord(role, ROLEWORDS) or rank >= 200 then
+					mod = true
+				end
+			end
+		end
+		roleCache[player] = {text = text, mod = mod}
+	end)
+	return roleCache[player]
+end
+
+local oldGui = LocalPlayer:WaitForChild("PlayerGui"):FindFirstChild("LevelScoutGui")
+if oldGui then
+	oldGui:Destroy()
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "LevelScoutGui"
+gui.ResetOnSpawn = false
+gui.IgnoreGuiInset = true
+gui.Parent = LocalPlayer.PlayerGui
+
+local main = Instance.new("Frame")
+main.Size = UDim2.new(0, 270, 0, 310)
+main.Position = UDim2.new(0.5, -135, 0.5, -155)
+main.BackgroundColor3 = Color3.fromRGB(18, 18, 20)
+main.BorderSizePixel = 0
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
+local stroke = Instance.new("UIStroke", main)
+stroke.Color = Color3.fromRGB(70, 70, 76)
+stroke.Thickness = 2
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -80, 0, 30)
+title.Position = UDim2.new(0, 10, 0, 0)
+title.BackgroundTransparency = 1
+title.Text = TITLE
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 13
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = main
+
+local hideBtn = Instance.new("TextButton")
+hideBtn.Size = UDim2.new(0, 24, 0, 24)
+hideBtn.Position = UDim2.new(1, -54, 0, 3)
+hideBtn.BackgroundTransparency = 1
+hideBtn.Text = ""
+hideBtn.Parent = main
+local hideLine = Instance.new("Frame")
+hideLine.Size = UDim2.new(0, 12, 0, 2)
+hideLine.Position = UDim2.new(0.5, -6, 0.5, 4)
+hideLine.BackgroundColor3 = Color3.new(1, 1, 1)
+hideLine.BorderSizePixel = 0
+hideLine.Parent = hideBtn
+Instance.new("UICorner", hideLine).CornerRadius = UDim.new(1, 0)
+
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.new(0, 24, 0, 24)
+closeBtn.Position = UDim2.new(1, -28, 0, 3)
+closeBtn.BackgroundTransparency = 1
+closeBtn.Text = "X"
+closeBtn.TextColor3 = Color3.new(1, 1, 1)
+closeBtn.Font = Enum.Font.GothamBold
+closeBtn.TextSize = 13
+closeBtn.Parent = main
+
+local list = Instance.new("ScrollingFrame")
+list.Size = UDim2.new(1, -12, 1, -38)
+list.Position = UDim2.new(0, 6, 0, 32)
+list.BackgroundTransparency = 1
+list.BorderSizePixel = 0
+list.ScrollBarThickness = 3
+list.CanvasSize = UDim2.new(0, 0, 0, 0)
+list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+list.Parent = main
+
+local layout = Instance.new("UIListLayout", list)
+layout.Padding = UDim.new(0, 6)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+
+local confirm = Instance.new("Frame")
+confirm.Size = UDim2.new(1, 0, 1, 0)
+confirm.BackgroundColor3 = Color3.new(0, 0, 0)
+confirm.BackgroundTransparency = 0.35
+confirm.BorderSizePixel = 0
+confirm.Active = true
+confirm.Visible = false
+confirm.ZIndex = 10
+confirm.Parent = main
+Instance.new("UICorner", confirm).CornerRadius = UDim.new(0, 8)
+
+local box = Instance.new("Frame")
+box.Size = UDim2.new(0, 210, 0, 104)
+box.Position = UDim2.new(0.5, -105, 0.5, -52)
+box.BackgroundColor3 = Color3.fromRGB(28, 28, 31)
+box.BorderSizePixel = 0
+box.ZIndex = 11
+box.Parent = confirm
+Instance.new("UICorner", box).CornerRadius = UDim.new(0, 8)
+local boxStroke = Instance.new("UIStroke", box)
+boxStroke.Color = Color3.fromRGB(70, 70, 76)
+boxStroke.Thickness = 1.5
+
+local ask = Instance.new("TextLabel")
+ask.Size = UDim2.new(1, -16, 0, 20)
+ask.Position = UDim2.new(0, 8, 0, 10)
+ask.BackgroundTransparency = 1
+ask.Text = "Close the menu?"
+ask.TextColor3 = Color3.new(1, 1, 1)
+ask.Font = Enum.Font.GothamBold
+ask.TextSize = 13
+ask.ZIndex = 12
+ask.Parent = box
+
+local askSub = Instance.new("TextLabel")
+askSub.Size = UDim2.new(1, -16, 0, 28)
+askSub.Position = UDim2.new(0, 8, 0, 32)
+askSub.BackgroundTransparency = 1
+askSub.Text = "This stops everything the script is doing."
+askSub.TextColor3 = Color3.fromRGB(185, 185, 190)
+askSub.Font = Enum.Font.Gotham
+askSub.TextSize = 10
+askSub.TextWrapped = true
+askSub.ZIndex = 12
+askSub.Parent = box
+
+local function boxBtn(text, x, color)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(0, 86, 0, 26)
+	b.Position = UDim2.new(0, x, 1, -34)
+	b.BackgroundColor3 = color
+	b.Text = text
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 11
+	b.ZIndex = 12
+	b.Parent = box
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+	return b
+end
+local yesBtn = boxBtn("Yes", 12, Color3.fromRGB(190, 60, 60))
+local noBtn = boxBtn("No", 112, Color3.fromRGB(50, 50, 56))
+
+local bar = Instance.new("Frame")
+bar.Size = UDim2.new(0, 190, 0, 34)
+bar.Position = UDim2.new(0.5, -95, 0, -50)
+bar.BackgroundColor3 = Color3.fromRGB(18, 18, 20)
+bar.BorderSizePixel = 0
+bar.Visible = false
+bar.Parent = gui
+Instance.new("UICorner", bar).CornerRadius = UDim.new(0, 8)
+local barStroke = Instance.new("UIStroke", bar)
+barStroke.Color = Color3.fromRGB(70, 70, 76)
+barStroke.Thickness = 2
+
+local handle = Instance.new("TextButton")
+handle.Size = UDim2.new(0, 34, 1, 0)
+handle.BackgroundTransparency = 1
+handle.Text = ""
+handle.Parent = bar
+local moveH = Instance.new("Frame")
+moveH.Size = UDim2.new(0, 14, 0, 2)
+moveH.Position = UDim2.new(0.5, -7, 0.5, -1)
+moveH.BackgroundColor3 = Color3.fromRGB(200, 200, 205)
+moveH.BorderSizePixel = 0
+moveH.Parent = handle
+local moveV = Instance.new("Frame")
+moveV.Size = UDim2.new(0, 2, 0, 14)
+moveV.Position = UDim2.new(0.5, -1, 0.5, -7)
+moveV.BackgroundColor3 = Color3.fromRGB(200, 200, 205)
+moveV.BorderSizePixel = 0
+moveV.Parent = handle
+
+local barName = Instance.new("TextLabel")
+barName.Size = UDim2.new(1, -90, 1, 0)
+barName.Position = UDim2.new(0, 38, 0, 0)
+barName.BackgroundTransparency = 1
+barName.Text = TITLE
+barName.TextColor3 = Color3.new(1, 1, 1)
+barName.Font = Enum.Font.GothamBold
+barName.TextSize = 12
+barName.TextXAlignment = Enum.TextXAlignment.Left
+barName.Parent = bar
+
+local toggle = Instance.new("TextButton")
+toggle.Size = UDim2.new(0, 34, 0, 18)
+toggle.Position = UDim2.new(1, -42, 0.5, -9)
+toggle.BackgroundColor3 = Color3.fromRGB(60, 60, 66)
+toggle.Text = ""
+toggle.AutoButtonColor = false
+toggle.Parent = bar
+Instance.new("UICorner", toggle).CornerRadius = UDim.new(1, 0)
+local knob = Instance.new("Frame")
+knob.Size = UDim2.new(0, 14, 0, 14)
+knob.Position = UDim2.new(0, 2, 0.5, -7)
+knob.BackgroundColor3 = Color3.new(1, 1, 1)
+knob.BorderSizePixel = 0
+knob.Parent = toggle
+Instance.new("UICorner", knob).CornerRadius = UDim.new(1, 0)
+
+local function makeDraggable(grip, target, onEnd)
+	local dragging, dragStart, startPos = false, nil, nil
+	track(grip.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = target.Position
+			local c
+			c = input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+					c:Disconnect()
+					if onEnd then
+						onEnd()
+					end
+				end
+			end)
+		end
+	end))
+	track(UIS.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - dragStart
+			target.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end))
+end
+
+local barHome = UDim2.new(0.5, -95, 0, 8)
+makeDraggable(title, main)
+makeDraggable(handle, bar, function()
+	barHome = bar.Position
+end)
+
+local hidden, busy, savedPos = false, false, nil
+local SLIDE = TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+local QUICK = TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+local function setHidden(v)
+	if busy or v == hidden then
+		return
+	end
+	busy = true
+	hidden = v
+	if v then
+		confirm.Visible = false
+		savedPos = main.Position
+		bar.Position = UDim2.new(barHome.X.Scale, barHome.X.Offset, 0, -50)
+		bar.Visible = true
+		TweenService:Create(bar, SLIDE, {Position = barHome}):Play()
+		local t = TweenService:Create(main, SLIDE, {Position = UDim2.new(savedPos.X.Scale, savedPos.X.Offset, 0, -(main.AbsoluteSize.Y + 60))})
+		t.Completed:Connect(function()
+			main.Visible = false
+			busy = false
+		end)
+		t:Play()
+	else
+		main.Visible = true
+		TweenService:Create(bar, SLIDE, {Position = UDim2.new(barHome.X.Scale, barHome.X.Offset, 0, -50)}):Play()
+		local t = TweenService:Create(main, SLIDE, {Position = savedPos})
+		t.Completed:Connect(function()
+			bar.Visible = false
+			busy = false
+		end)
+		t:Play()
+	end
+end
+
+hideBtn.MouseButton1Click:Connect(function()
+	setHidden(true)
+end)
+
+toggle.MouseButton1Click:Connect(function()
+	if not hidden or busy then
+		return
+	end
+	TweenService:Create(knob, QUICK, {Position = UDim2.new(1, -16, 0.5, -7)}):Play()
+	TweenService:Create(toggle, QUICK, {BackgroundColor3 = Color3.fromRGB(70, 200, 110)}):Play()
+	task.delay(0.2, function()
+		if not running then
+			return
+		end
+		setHidden(false)
+		task.delay(0.4, function()
+			if running then
+				knob.Position = UDim2.new(0, 2, 0.5, -7)
+				toggle.BackgroundColor3 = Color3.fromRGB(60, 60, 66)
+			end
+		end)
+	end)
+end)
+
+local function stopAll()
+	running = false
+	for _, c in ipairs(conns) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	conns = {}
+	env.VD_Ingest = nil
+	env.VD_Stop = nil
+	found = {}
+	pcall(function()
+		gui:Destroy()
+	end)
+end
+env.VD_Stop = stopAll
+
+closeBtn.MouseButton1Click:Connect(function()
+	if not hidden then
+		confirm.Visible = true
+	end
+end)
+noBtn.MouseButton1Click:Connect(function()
+	confirm.Visible = false
+end)
+yesBtn.MouseButton1Click:Connect(function()
+	stopAll()
+end)
+
+local cards = {}
+
+local function makeCard(player)
+	local card = Instance.new("Frame")
+	card.Size = UDim2.new(1, -4, 0, 0)
+	card.AutomaticSize = Enum.AutomaticSize.Y
+	card.BackgroundColor3 = Color3.fromRGB(26, 26, 29)
+	card.BorderSizePixel = 0
+	Instance.new("UICorner", card).CornerRadius = UDim.new(0, 6)
+
+	local avatar = Instance.new("ImageLabel")
+	avatar.Size = UDim2.new(0, 40, 0, 40)
+	avatar.Position = UDim2.new(0, 8, 0, 8)
+	avatar.BackgroundColor3 = Color3.fromRGB(38, 38, 42)
+	avatar.Parent = card
+	Instance.new("UICorner", avatar).CornerRadius = UDim.new(1, 0)
+	task.spawn(function()
+		local ok, img = pcall(function()
+			return Players:GetUserThumbnailAsync(player.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+		end)
+		if ok and avatar.Parent then
+			avatar.Image = img
+		end
+	end)
+
+	local nameLabel = Instance.new("TextLabel")
+	nameLabel.Size = UDim2.new(1, -62, 0, 16)
+	nameLabel.Position = UDim2.new(0, 56, 0, 9)
+	nameLabel.BackgroundTransparency = 1
+	nameLabel.Text = player.DisplayName .. " (" .. player.Name .. ")"
+	nameLabel.TextColor3 = Color3.new(1, 1, 1)
+	nameLabel.Font = Enum.Font.GothamBold
+	nameLabel.TextSize = 11
+	nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+	nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+	nameLabel.Parent = card
+
+	local role = Instance.new("TextLabel")
+	role.Name = "Role"
+	role.Size = UDim2.new(1, -62, 0, 14)
+	role.Position = UDim2.new(0, 56, 0, 26)
+	role.BackgroundTransparency = 1
+	role.Text = "Player"
+	role.TextColor3 = Color3.fromRGB(185, 185, 190)
+	role.Font = Enum.Font.Gotham
+	role.TextSize = 10
+	role.TextXAlignment = Enum.TextXAlignment.Left
+	role.TextTruncate = Enum.TextTruncate.AtEnd
+	role.Parent = card
+
+	local info = Instance.new("TextLabel")
+	info.Name = "Info"
+	info.Size = UDim2.new(1, -16, 0, 0)
+	info.AutomaticSize = Enum.AutomaticSize.Y
+	info.Position = UDim2.new(0, 8, 0, 54)
+	info.BackgroundTransparency = 1
+	info.Text = "Scanning..."
+	info.TextColor3 = Color3.fromRGB(225, 225, 230)
+	info.Font = Enum.Font.Gotham
+	info.TextSize = 10
+	info.LineHeight = 1.1
+	info.TextXAlignment = Enum.TextXAlignment.Left
+	info.TextYAlignment = Enum.TextYAlignment.Top
+	info.Parent = card
+
+	local pad = Instance.new("UIPadding", card)
+	pad.PaddingBottom = UDim.new(0, 8)
+
+	card.Parent = list
+	return card
+end
+
+local function refresh()
+	for p, c in pairs(cards) do
+		if not p.Parent then
+			c:Destroy()
+			cards[p] = nil
+			found[p] = nil
+			lastScan[p] = nil
+			roleCache[p] = nil
+		end
+	end
+	for i, player in ipairs(Players:GetPlayers()) do
+		local card = cards[player] or makeCard(player)
+		cards[player] = card
+		card.LayoutOrder = i
+		local raws = {}
+		for _, key in ipairs(KEYS) do
+			local a, b = rawStat(player, key)
+			raws[key] = {a, b}
+		end
+		local mode = playerMode(raws)
+		local lines, any = {}, false
+		for _, key in ipairs(KEYS) do
+			local v, lv, exact = resolveStat(key, raws[key][1], raws[key][2], mode)
+			if v or lv then
+				any = true
+				lines[#lines + 1] = key .. ": " .. (v and fmt(v) or "?") .. " (Lv. " .. (lv and ((exact and "" or "~") .. fmt(lv)) or "?") .. ")"
+			else
+				lines[#lines + 1] = key .. ": N/A"
+			end
+		end
+		if not any then
+			lines[#lines + 1] = "No data found yet"
+		end
+		local text = table.concat(lines, "\n")
+		if card.Info.Text ~= text then
+			card.Info.Text = text
+		end
+		local r = getRole(player)
+		local extra = {}
+		for k, v in pairs(player:GetAttributes()) do
+			if v and hasWord(k, ATTRWORDS) then
+				extra[#extra + 1] = k .. "=" .. tostring(v)
+			end
+		end
+		local txt = "Player"
+		if r.mod then
+			txt = "MOD - " .. r.text
+		end
+		if #extra > 0 then
+			txt = txt .. " [" .. table.concat(extra, ", ") .. "]"
+		end
+		if card.Role.Text ~= txt then
+			card.Role.Text = txt
+		end
+		card.Role.TextColor3 = r.mod and Color3.fromRGB(255, 170, 60) or Color3.fromRGB(185, 185, 190)
+	end
+end
+
+task.spawn(function()
+	local t = 0
+	while running and gui.Parent do
+		if t % 10 == 0 then
+			for _, p in ipairs(Players:GetPlayers()) do
+				pcall(scanPlayer, p)
+			end
+		else
+			for _, p in ipairs(Players:GetPlayers()) do
+				if not found[p] and (not lastScan[p] or os.clock() - lastScan[p] > 8) then
+					pcall(scanPlayer, p)
+				end
+			end
+		end
+		if t % 15 == 0 then
+			pcall(scanWorld)
+		end
+		pcall(refresh)
+		t = t + 1
+		task.wait(2)
+	end
+end)
